@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """
-Multi-source book scraper with progress tracking, metadata extraction, and Kindle conversion
-Supports: Project Gutenberg, Archive.org
-Features: Multi-URL fallback, automatic retry, author organization
+Supports: Gutenberg, Internet Archive, Open Library, DOAB, Standard Ebooks
 """
 
-import hashlib
+import argparse
 import json
 import logging
-import re
 import sqlite3
-import subprocess
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
-from threading import Lock
 from typing import Dict, List, Optional
 
 import requests
@@ -29,717 +24,1084 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def normalize_author_name(author_name: str) -> str:
-    """Normalize author name: strip whitespace, title case"""
-    return " ".join(author_name.strip().split()).title()
-
-
 @dataclass
 class Book:
-    """Book metadata with support for multiple download URLs"""
+    """Enhanced book metadata with modern features"""
 
     id: str
     title: str
     author: str
     source: str
+    download_urls: List[str] = field(default_factory=list)
+    format: str = "epub"
     year: Optional[int] = None
+    description: Optional[str] = None
+    cover_url: Optional[str] = None
+    isbn: Optional[str] = None
     language: str = "en"
     subjects: List[str] = field(default_factory=list)
-    download_url: Optional[str] = None
-    download_urls: List[str] = field(default_factory=list)
-    cover_url: Optional[str] = None
-    downloaded: bool = False
-    copyright_status: str = "unknown"
-    lending_required: bool = False
 
-    def __post_init__(self):
-        """Ensure download_urls is populated from download_url if empty"""
-        if not self.download_urls and self.download_url:
-            self.download_urls = [self.download_url]
+    # Open Library specific
+    is_borrowable: bool = False
+    availability: Optional[Dict] = None
+    borrow_url: Optional[str] = None
 
 
 class BookDatabase:
-    """SQLite database to track downloaded books"""
+    """Enhanced database with borrowing tracking"""
 
-    def __init__(self, db_path: str = "books.db"):
+    def __init__(self, db_path: str = "books_enhanced.db"):
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.lock = Lock()  # Thread-safe operations
-        self.create_tables()
+        self.conn.row_factory = sqlite3.Row
+        self._create_tables()
 
-    def create_tables(self) -> None:
-        """Create books table if it doesn't exist"""
-        cursor = self.conn.cursor()
-        cursor.execute(
+    def _create_tables(self):
+        """Create enhanced database schema"""
+        self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS books (
                 id TEXT PRIMARY KEY,
-                title TEXT,
-                author TEXT,
-                source TEXT,
+                title TEXT NOT NULL,
+                author TEXT NOT NULL,
+                source TEXT NOT NULL,
+                format TEXT,
                 year INTEGER,
+                description TEXT,
+                isbn TEXT,
                 language TEXT,
                 subjects TEXT,
-                download_url TEXT,
-                cover_url TEXT,
-                downloaded BOOLEAN,
                 file_path TEXT,
-                file_hash TEXT,
-                copyright_status TEXT,
-                lending_required BOOLEAN,
-                downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """
+                download_date TIMESTAMP,
+                file_size INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS borrows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id TEXT NOT NULL,
+                borrow_date TIMESTAMP,
+                due_date TIMESTAMP,
+                return_date TIMESTAMP,
+                status TEXT,
+                FOREIGN KEY (book_id) REFERENCES books(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS download_urls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                book_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                url_type TEXT,
+                working BOOLEAN,
+                last_checked TIMESTAMP,
+                FOREIGN KEY (book_id) REFERENCES books(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_author ON books(author);
+            CREATE INDEX IF NOT EXISTS idx_source ON books(source);
+            CREATE INDEX IF NOT EXISTS idx_year ON books(year);
+            """
         )
         self.conn.commit()
 
-    def add_book(
-        self,
-        book: Book,
-        file_path: Optional[str] = None,
-        file_hash: Optional[str] = None,
-    ) -> None:
-        """Add or update a book in the database"""
-        with self.lock:
-            cursor = self.conn.cursor()
-            cursor.execute(
+    def add_book(self, book: Book, file_path: Optional[str] = None):
+        """Add or update book in database"""
+        try:
+            self.conn.execute(
                 """
                 INSERT OR REPLACE INTO books 
-                (id, title, author, source, year, language, subjects, download_url, 
-                 cover_url, downloaded, file_path, file_hash, copyright_status, lending_required)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+                (id, title, author, source, format, year, description, isbn, language, subjects, file_path, download_date, file_size)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     book.id,
                     book.title,
                     book.author,
                     book.source,
+                    book.format,
                     book.year,
+                    book.description,
+                    book.isbn,
                     book.language,
                     json.dumps(book.subjects),
-                    book.download_url,
-                    book.cover_url,
-                    book.downloaded,
                     file_path,
-                    file_hash,
-                    book.copyright_status,
-                    book.lending_required,
+                    datetime.now().isoformat() if file_path else None,
+                    (
+                        Path(file_path).stat().st_size
+                        if file_path and Path(file_path).exists()
+                        else None
+                    ),
                 ),
             )
+
+            # Add URLs
+            for url in book.download_urls:
+                self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO download_urls (book_id, url, last_checked)
+                    VALUES (?, ?, ?)
+                    """,
+                    (book.id, url, datetime.now().isoformat()),
+                )
+
             self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Database error adding book {book.id}: {e}")
+            return False
 
-    def is_downloaded(self, book_id: str) -> bool:
-        """Check if a book has been downloaded"""
-        with self.lock:
-            cursor = self.conn.cursor()
-            result = cursor.execute(
-                "SELECT downloaded FROM books WHERE id = ?", (book_id,)
-            ).fetchone()
-            return bool(result[0]) if result else False
+    def book_exists(self, book_id: str) -> bool:
+        """Check if book exists in database"""
+        cursor = self.conn.execute(
+            "SELECT id FROM books WHERE id = ? AND file_path IS NOT NULL", (book_id,)
+        )
+        return cursor.fetchone() is not None
 
-    def get_all_books(self) -> List[Dict]:
-        """Get all books from database as dictionaries"""
-        with self.lock:
-            cursor = self.conn.cursor()
-            results = cursor.execute("SELECT * FROM books").fetchall()
-            columns = [desc[0] for desc in cursor.description]
-            return [dict(zip(columns, row)) for row in results]
+    def add_borrow(self, book_id: str, due_date: datetime):
+        """Track a borrowed book"""
+        self.conn.execute(
+            """
+            INSERT INTO borrows (book_id, borrow_date, due_date, status)
+            VALUES (?, ?, ?, 'active')
+            """,
+            (book_id, datetime.now().isoformat(), due_date.isoformat()),
+        )
+        self.conn.commit()
 
-    def close(self) -> None:
+    def get_active_borrows(self) -> List[Dict]:
+        """Get all active borrowed books"""
+        cursor = self.conn.execute(
+            """
+            SELECT b.*, bk.title, bk.author, bk.source
+            FROM borrows b
+            JOIN books bk ON b.book_id = bk.id
+            WHERE b.status = 'active'
+            ORDER BY b.due_date
+            """
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_stats(self) -> Dict:
+        """Get download statistics"""
+        cursor = self.conn.execute(
+            """
+            SELECT 
+                COUNT(*) as total,
+                COUNT(CASE WHEN file_path IS NOT NULL THEN 1 END) as downloaded,
+                source,
+                COUNT(*) as count
+            FROM books
+            GROUP BY source
+            """
+        )
+        stats = {"by_source": {}}
+        for row in cursor.fetchall():
+            stats["by_source"][row["source"]] = row["count"]
+
+        cursor = self.conn.execute(
+            "SELECT COUNT(*) as total, SUM(file_size) as total_size FROM books WHERE file_path IS NOT NULL"
+        )
+        row = cursor.fetchone()
+        stats["total_downloaded"] = row["total"]
+        stats["total_size_mb"] = (
+            row["total_size"] / (1024 * 1024) if row["total_size"] else 0
+        )
+
+        return stats
+
+    def close(self):
         """Close database connection"""
-        self.conn.close()
+        if self.conn:
+            self.conn.close()
+
+    def __enter__(self):
+        """Context manager entry"""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit"""
+        self.close()
+        return False
+
+
+class OpenLibraryScraper:
+    """Scraper for Open Library (modern books, borrowing system)"""
+
+    def __init__(self):
+        self.base_url = "https://openlibrary.org"
+        self.api_url = "https://openlibrary.org/api"
+        self.session = requests.Session()
+        self.session.headers.update(
+            {"User-Agent": "BookScraperBot/2.0 (Educational; Linux)"}
+        )
+
+    def search_author(self, author_name: str, limit: int = 50) -> List[Book]:
+        """Search for books by author on Open Library"""
+        if not author_name or not author_name.strip():
+            logger.error("Author name cannot be empty")
+            return []
+
+        books = []
+
+        try:
+            # Search API
+            search_url = f"{self.base_url}/search.json"
+            params = {
+                "author": author_name.strip(),
+                "limit": max(1, min(limit, 100)),  # Clamp between 1-100
+                "has_fulltext": "true",  # Only books with full text
+            }
+
+            logger.info(f"Searching Open Library for '{author_name}'")
+            response = self.session.get(search_url, params=params, timeout=30)
+            response.raise_for_status()
+            data = response.json()
+
+            if "docs" not in data:
+                logger.warning(f"No results from Open Library for '{author_name}'")
+                return books
+
+            logger.info(f"Found {len(data['docs'])} potential books on Open Library")
+
+            for doc in data["docs"]:
+                try:
+                    book_key = doc.get("key", "")
+                    if not book_key:
+                        continue
+
+                    # Get detailed info
+                    book = self._get_book_details(book_key, doc)
+                    if book:
+                        books.append(book)
+
+                except Exception as e:
+                    logger.debug(f"Error processing book: {e}")
+                    continue
+
+            logger.info(f"Successfully processed {len(books)} books from Open Library")
+
+        except Exception as e:
+            logger.error(f"Error searching Open Library: {e}")
+
+        return books
+
+    def _get_book_details(self, book_key: str, search_doc: Dict) -> Optional[Book]:
+        """Get detailed book information"""
+        try:
+            # Extract ID from key (e.g., '/works/OL123W' -> 'OL123W')
+            book_id = book_key.split("/")[-1]
+
+            title = search_doc.get("title", "Unknown")
+            author = ", ".join(search_doc.get("author_name", ["Unknown"]))
+            year = search_doc.get("first_publish_year")
+
+            # Check if borrowable
+            ia_id = search_doc.get("ia", [])
+            lending_edition = search_doc.get("lending_edition_s")
+            has_fulltext = search_doc.get("has_fulltext", False)
+
+            # Build download URLs
+            download_urls = []
+            is_borrowable = False
+            borrow_url = None
+
+            if ia_id and len(ia_id) > 0:
+                # Internet Archive identifier available
+                ia_identifier = ia_id[0]
+                download_urls.append(
+                    f"https://archive.org/download/{ia_identifier}/{ia_identifier}.epub"
+                )
+                download_urls.append(
+                    f"https://archive.org/download/{ia_identifier}/{ia_identifier}.pdf"
+                )
+                is_borrowable = True
+                borrow_url = f"https://openlibrary.org{book_key}"
+
+            if lending_edition:
+                # Add lending edition URL
+                download_urls.append(
+                    f"https://openlibrary.org/books/{lending_edition}.epub"
+                )
+                is_borrowable = True
+
+            # Get cover
+            cover_id = search_doc.get("cover_i")
+            cover_url = (
+                f"https://covers.openlibrary.org/b/id/{cover_id}-L.jpg"
+                if cover_id
+                else None
+            )
+
+            # Get ISBN
+            isbn = search_doc.get("isbn", [None])[0] if search_doc.get("isbn") else None
+
+            # Subjects
+            subjects = search_doc.get("subject", [])[:5]  # Top 5 subjects
+
+            book = Book(
+                id=f"openlibrary_{book_id}",
+                title=title,
+                author=author,
+                source="openlibrary",
+                download_urls=download_urls,
+                year=year,
+                description=None,  # Could fetch from work page
+                cover_url=cover_url,
+                isbn=isbn,
+                subjects=subjects,
+                is_borrowable=is_borrowable,
+                borrow_url=borrow_url,
+            )
+
+            return book if download_urls else None
+
+        except Exception as e:
+            logger.debug(f"Error getting book details: {e}")
+            return None
+
+    def close(self):
+        """Close session"""
+        if self.session:
+            self.session.close()
+
+    def __enter__(self):
+        """Context manager entry"""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit"""
+        self.close()
+        return False
+
+
+class DOABScraper:
+    """Scraper for Directory of Open Access Books (academic books)"""
+
+    def __init__(self):
+        self.base_url = "https://www.doabooks.org"
+        self.api_url = "https://directory.doabooks.org/rest"
+        self.session = requests.Session()
+
+    def search_author(self, author_name: str, limit: int = 50) -> List[Book]:
+        """Search DOAB for open access books"""
+        books = []
+
+        try:
+            # DOAB API search
+            search_url = f"{self.api_url}/search"
+            params = {
+                "query": f"author:{author_name}",
+                "expand": "metadata",
+                "limit": limit,
+            }
+
+            logger.info(f"Searching DOAB for '{author_name}'")
+            response = self.session.get(search_url, params=params, timeout=30)
+
+            if response.status_code != 200:
+                logger.warning(f"DOAB API returned status {response.status_code}")
+                return books
+
+            # Parse results (DOAB returns XML/JSON depending on endpoint)
+            # This is a simplified version - actual implementation may vary
+            data = (
+                response.json()
+                if "json" in response.headers.get("content-type", "")
+                else {}
+            )
+
+            # Process results (structure depends on DOAB API version)
+            # Placeholder for actual implementation
+            logger.info(f"DOAB search complete (implementation may need API key)")
+
+        except Exception as e:
+            logger.error(f"Error searching DOAB: {e}")
+
+        return books
+
+    def close(self):
+        """Close session"""
+        if self.session:
+            self.session.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+
+class StandardEbooksScraper:
+    """Scraper for Standard Ebooks (high-quality public domain)"""
+
+    def __init__(self):
+        self.base_url = "https://standardebooks.org"
+        self.session = requests.Session()
+
+    def search_author(self, author_name: str, limit: int = 50) -> List[Book]:
+        """Search Standard Ebooks"""
+        books = []
+
+        try:
+            # Standard Ebooks has an OPDS feed
+            opds_url = f"{self.base_url}/opds/all"
+
+            logger.info(f"Searching Standard Ebooks for '{author_name}'")
+            response = self.session.get(opds_url, timeout=30)
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.content, "xml")
+
+            # Parse OPDS feed entries
+            entries = soup.find_all("entry")
+
+            for entry in entries[:limit]:
+                try:
+                    # Get author
+                    author_elem = entry.find("author")
+                    if not author_elem:
+                        continue
+
+                    book_author = (
+                        author_elem.find("name").text
+                        if author_elem.find("name")
+                        else ""
+                    )
+
+                    # Check if author matches (case-insensitive)
+                    if author_name.lower() not in book_author.lower():
+                        continue
+
+                    # Get title
+                    title_elem = entry.find("title")
+                    title = title_elem.text if title_elem else "Unknown"
+
+                    # Get ID
+                    id_elem = entry.find("id")
+                    book_id = id_elem.text.split("/")[-1] if id_elem else None
+
+                    if not book_id:
+                        continue
+
+                    # Get download link
+                    links = entry.find_all("link")
+                    download_urls = []
+
+                    for link in links:
+                        if link.get("type") == "application/epub+zip":
+                            download_urls.append(link.get("href"))
+
+                    if not download_urls:
+                        continue
+
+                    # Get cover
+                    cover_link = entry.find(
+                        "link", {"rel": "http://opds-spec.org/image"}
+                    )
+                    cover_url = cover_link.get("href") if cover_link else None
+
+                    # Get description
+                    summary = entry.find("summary")
+                    description = summary.text if summary else None
+
+                    book = Book(
+                        id=f"standardebooks_{book_id}",
+                        title=title,
+                        author=book_author,
+                        source="standardebooks",
+                        download_urls=download_urls,
+                        description=description,
+                        cover_url=cover_url,
+                    )
+
+                    books.append(book)
+
+                except Exception as e:
+                    logger.debug(f"Error processing Standard Ebooks entry: {e}")
+                    continue
+
+            logger.info(f"Found {len(books)} books on Standard Ebooks")
+
+        except Exception as e:
+            logger.error(f"Error searching Standard Ebooks: {e}")
+
+        return books
+
+    def close(self):
+        """Close session"""
+        if self.session:
+            self.session.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
 
 class GutenbergScraper:
-    """Project Gutenberg scraper with multi-URL fallback support"""
+    """Enhanced Gutenberg scraper (keeping original functionality)"""
 
     def __init__(self):
         self.base_url = "https://www.gutenberg.org"
         self.session = requests.Session()
         self.session.headers.update(
-            {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) BookScraper/1.0"}
+            {"User-Agent": "BookScraperBot/2.0 (Educational; Linux)"}
         )
 
-    def search_author(self, author_name: str) -> Optional[str]:
-        """Search for author and return their bibliography page URL"""
-        # Normalize author name first
-        author_name = normalize_author_name(author_name)
-        author_slug = author_name.lower().replace(" ", "_").replace(",", "")
-        search_url = f"{self.base_url}/ebooks/author/{author_slug}"
-
-        try:
-            response = self.session.get(search_url, timeout=10)
-            if response.status_code == 200:
-                return response.url
-        except Exception as e:
-            logger.error(f"Error searching for author: {e}")
-
-        return None
-
-    def get_book_metadata(self, book_id: str) -> Optional[Book]:
-        """Get detailed metadata for a book including multiple download URLs"""
-        url = f"{self.base_url}/ebooks/{book_id}"
-
-        try:
-            response = self.session.get(url, timeout=10)
-            soup = BeautifulSoup(response.content, "html.parser")
-
-            title_elem = soup.find("h1", itemprop="name")
-            title = title_elem.get_text(strip=True) if title_elem else f"Book {book_id}"
-
-            author_elem = soup.find("a", itemprop="creator")
-            author = author_elem.get_text(strip=True) if author_elem else "Unknown"
-
-            # Get subjects
-            subjects = [
-                subject.get_text(strip=True)
-                for subject in soup.find_all(
-                    "a", href=re.compile(r"/ebooks/bookshelf/")
-                )
-            ]
-
-            # Get language
-            language_elem = soup.find("tr", {"property": "dcterms:language"})
-            if language_elem and language_elem.find("td"):
-                language = language_elem.find("td").get_text(strip=True)
-            else:
-                language = "en"
-
-            # Construct multiple download URLs as fallbacks
-            download_urls = [
-                f"{self.base_url}/ebooks/{book_id}.epub3.images",  # Best quality
-                f"{self.base_url}/ebooks/{book_id}.epub.noimages",  # Most reliable
-                f"{self.base_url}/ebooks/{book_id}.epub.images",  # Legacy format
-                f"{self.base_url}/files/{book_id}/{book_id}-0.epub",  # Direct download
-                f"{self.base_url}/files/{book_id}/{book_id}.epub",  # Alternative path
-            ]
-
-            return Book(
-                id=f"gutenberg_{book_id}",
-                title=title,
-                author=author,
-                source="gutenberg",
-                language=language,
-                subjects=subjects,
-                download_urls=download_urls,
-                download_url=download_urls[0],
-                copyright_status="public_domain",
-                lending_required=False,
-            )
-
-        except Exception as e:
-            logger.error(f"Error getting metadata for book {book_id}: {e}")
-            return None
-
     def get_author_books(self, author_name: str) -> List[Book]:
-        """Get all books from an author"""
-        author_url = self.search_author(author_name)
-        if not author_url:
-            logger.warning(f"Author '{author_name}' not found")
-            return []
+        """Get books by author from Gutenberg"""
+        books = []
 
         try:
-            response = self.session.get(author_url, timeout=10)
+            # Search for author
+            search_url = f"{self.base_url}/ebooks/author/"
+            author_slug = author_name.lower().replace(" ", "_").replace(".", "")
+
+            logger.info(f"Searching Gutenberg for '{author_name}'")
+            response = self.session.get(f"{search_url}{author_slug}", timeout=30)
+
+            if response.status_code != 200:
+                logger.warning(f"Author '{author_name}' not found on Gutenberg")
+                return books
+
             soup = BeautifulSoup(response.content, "html.parser")
 
-            books = []
-            book_links = soup.find_all("li", class_="booklink")
+            # Find all book entries
+            book_list = soup.find("ol", class_="results")
+            if not book_list:
+                return books
 
-            for link in tqdm(book_links, desc="Fetching metadata"):
-                book_link = link.find("a", href=re.compile(r"/ebooks/\d+"))
-                if book_link:
-                    book_id_match = re.search(r"/ebooks/(\d+)", book_link["href"])
-                    if book_id_match:
-                        book = self.get_book_metadata(book_id_match.group(1))
-                        if book:
-                            books.append(book)
-                        time.sleep(0.5)  # Rate limiting
+            for li in book_list.find_all("li", class_="booklink"):
+                try:
+                    # Get book title and ID
+                    title_link = li.find("a", class_="link")
+                    if not title_link:
+                        continue
 
-            return books
+                    title = title_link.find("span", class_="title").text.strip()
+                    book_id = title_link.get("href").split("/")[-1]
+
+                    # Build download URLs
+                    download_urls = [
+                        f"{self.base_url}/ebooks/{book_id}.epub3.images",
+                        f"{self.base_url}/ebooks/{book_id}.epub.images",
+                        f"{self.base_url}/ebooks/{book_id}.epub.noimages",
+                        f"{self.base_url}/files/{book_id}/{book_id}-0.epub",
+                    ]
+
+                    book = Book(
+                        id=f"gutenberg_{book_id}",
+                        title=title,
+                        author=author_name,
+                        source="gutenberg",
+                        download_urls=download_urls,
+                    )
+
+                    books.append(book)
+
+                except Exception as e:
+                    logger.debug(f"Error processing Gutenberg book: {e}")
+                    continue
+
+            logger.info(f"Found {len(books)} books on Gutenberg")
 
         except Exception as e:
-            logger.error(f"Error getting books for author: {e}")
-            return []
+            logger.error(f"Error searching Gutenberg: {e}")
+
+        return books
+
+    def close(self):
+        """Close session"""
+        if self.session:
+            self.session.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
 
-class ArchiveScraper:
-    """Internet Archive scraper with multi-format fallback"""
+class InternetArchiveScraper:
+    """Enhanced Internet Archive scraper"""
 
     def __init__(self):
         self.base_url = "https://archive.org"
         self.session = requests.Session()
-        self.session.headers.update(
-            {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) BookScraper/1.0"}
-        )
 
     def search_author(self, author_name: str, limit: int = 50) -> List[Book]:
-        """Search for books by author on Archive.org"""
-        # Normalize author name first
-        author_name = normalize_author_name(author_name)
-        search_url = f"{self.base_url}/advancedsearch.php"
-        params = {
-            "q": f'creator:"{author_name}" AND mediatype:texts',
-            "fl[]": [
-                "identifier",
-                "title",
-                "creator",
-                "year",
-                "subject",
-                "possible-copyright-status",
-                "lending",
-            ],
-            "sort[]": "downloads desc",
-            "rows": limit,
-            "page": 1,
-            "output": "json",
-        }
+        """Search Internet Archive for books"""
+        books = []
 
         try:
-            response = self.session.get(search_url, params=params, timeout=10)
+            search_url = f"{self.base_url}/advancedsearch.php"
+            params = {
+                "q": f'creator:"{author_name}" AND mediatype:texts',
+                "fl[]": ["identifier", "title", "creator", "year", "description"],
+                "rows": limit,
+                "page": 1,
+                "output": "json",
+            }
+
+            logger.info(f"Searching Internet Archive for '{author_name}'")
+            response = self.session.get(search_url, params=params, timeout=30)
+            response.raise_for_status()
+
             data = response.json()
 
-            books = []
-            pd_count = 0
-            restricted_count = 0
+            if "response" not in data or "docs" not in data["response"]:
+                logger.warning(f"No results from Internet Archive for '{author_name}'")
+                return books
 
             for doc in data["response"]["docs"]:
-                identifier = doc["identifier"]
+                try:
+                    identifier = doc.get("identifier")
+                    if not identifier:
+                        continue
 
-                # Check copyright
-                copyright_status = doc.get("possible-copyright-status", "unknown")
-                is_pd = copyright_status == "NOT_IN_COPYRIGHT"
-                needs_lending = doc.get("lending", False)
+                    title = doc.get("title", "Unknown")
+                    author = (
+                        doc.get("creator", ["Unknown"])[0]
+                        if isinstance(doc.get("creator"), list)
+                        else doc.get("creator", "Unknown")
+                    )
+                    year = doc.get("year")
+                    description = doc.get("description")
 
-                if is_pd:
-                    pd_count += 1
-                else:
-                    restricted_count += 1
+                    # Build download URLs
+                    download_urls = [
+                        f"{self.base_url}/download/{identifier}/{identifier}.epub",
+                        f"{self.base_url}/download/{identifier}/{identifier}.pdf",
+                        f"{self.base_url}/download/{identifier}/{identifier}.mobi",
+                    ]
 
-                # Multiple URL fallbacks for different formats
-                download_urls = [
-                    f"{self.base_url}/download/{identifier}/{identifier}.epub",
-                    f"{self.base_url}/download/{identifier}/{identifier}.pdf",
-                    f"{self.base_url}/download/{identifier}/{identifier}.mobi",
-                    f"{self.base_url}/download/{identifier}/{identifier}_text.pdf",
-                ]
+                    book = Book(
+                        id=f"archive_{identifier}",
+                        title=title,
+                        author=author,
+                        source="archive",
+                        download_urls=download_urls,
+                        year=int(year) if year else None,
+                        description=description,
+                    )
 
-                # Handle creator field (can be list or string)
-                creator = doc.get("creator", "Unknown")
-                if isinstance(creator, list):
-                    creator = creator[0] if creator else "Unknown"
+                    books.append(book)
 
-                # Handle subject field (can be list or string)
-                subjects = doc.get("subject", [])
-                if not isinstance(subjects, list):
-                    subjects = [subjects] if subjects else []
+                except Exception as e:
+                    logger.debug(f"Error processing Archive book: {e}")
+                    continue
 
-                book = Book(
-                    id=f"archive_{identifier}",
-                    title=doc.get("title", "Unknown"),
-                    author=creator,
-                    source="archive",
-                    year=doc.get("year"),
-                    subjects=subjects,
-                    download_urls=download_urls,
-                    download_url=download_urls[0],
-                    copyright_status="public_domain" if is_pd else "copyrighted",
-                    lending_required=needs_lending,
-                )
-                books.append(book)
-
-            logger.info(f"Found {len(books)} books")
-            if pd_count > 0:
-                logger.info(f"  Public domain: {pd_count}")
-            if restricted_count > 0:
-                logger.warning(f"  Copyrighted/Lending required: {restricted_count}")
-
-            return books
+            logger.info(f"Found {len(books)} books on Internet Archive")
 
         except Exception as e:
-            logger.error(f"Error searching Archive.org: {e}")
-            return []
+            logger.error(f"Error searching Internet Archive: {e}")
+
+        return books
+
+    def close(self):
+        """Close session"""
+        if self.session:
+            self.session.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
 
 class BookDownloader:
-    """Download and convert books with multi-URL fallback and author organization"""
+    """Enhanced book downloader with resilience"""
 
-    def __init__(
-        self,
-        output_dir: str = "books",
-        db: Optional[BookDatabase] = None,
-        organize_by_author: bool = True,
-    ):
+    def __init__(self, output_dir: str = "books"):
         self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
-        self.db = db
-        self.organize_by_author = organize_by_author
+        self.output_dir.mkdir(exist_ok=True, parents=True)
         self.session = requests.Session()
         self.session.headers.update(
-            {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) BookScraper/1.0"}
+            {"User-Agent": "BookScraperBot/2.0 (Educational; Linux)"}
         )
 
-    def sanitize_filename(self, filename: str) -> str:
-        """Clean filename for filesystem compatibility"""
-        return re.sub(r'[<>:"/\\|?*]', "_", filename)[:200]
-
-    def calculate_hash(self, file_path: Path) -> str:
-        """Calculate SHA256 hash of file"""
-        sha256_hash = hashlib.sha256()
-        with open(file_path, "rb") as f:
-            for byte_block in iter(lambda: f.read(4096), b""):
-                sha256_hash.update(byte_block)
-        return sha256_hash.hexdigest()
-
-    def download_book(self, book: Book, format: str = "epub") -> Optional[Path]:
-        """Download a single book, trying multiple URLs if needed"""
-        if self.db and self.db.is_downloaded(book.id):
-            logger.info(f"Already downloaded: {book.title}")
+    def download_book(self, book: Book) -> Optional[str]:
+        """Download book with multi-URL fallback"""
+        if not book or not book.download_urls:
+            logger.warning(
+                f"No download URLs for book: {book.title if book else 'Unknown'}"
+            )
             return None
 
-        # Skip copyrighted books
-        if book.copyright_status == "copyrighted":
-            logger.warning(f"⚠️  Skipping '{book.title}' - Copyrighted")
-            return None
+        # Normalize and sanitize author name for consistent folders
+        safe_author = (
+            "".join(c for c in book.author if c.isalnum() or c in (" ", "-", "_"))
+            .strip()
+            .replace(" ", "_")
+        )
 
-        if book.lending_required:
-            logger.warning(f"⚠️  Skipping '{book.title}' - Requires borrowing/auth")
-            return None
+        if not safe_author:
+            safe_author = "Unknown_Author"
 
-        # Create author subdirectory if organizing by author
-        if self.organize_by_author:
-            author_dir = self.output_dir / self.sanitize_filename(book.author)
-            author_dir.mkdir(exist_ok=True)
-            base_dir = author_dir
-        else:
-            base_dir = self.output_dir
+        # Create author directory (all sources/formats go here)
+        author_dir = self.output_dir / safe_author
+        author_dir.mkdir(exist_ok=True, parents=True)
 
-        filename = self.sanitize_filename(f"{book.author} - {book.title}")
-        file_extension = format
-        output_path = base_dir / f"{filename}.{file_extension}"
+        # Sanitize title
+        safe_title = "".join(
+            c for c in book.title if c.isalnum() or c in (" ", "-", "_")
+        ).strip()
 
-        if output_path.exists():
-            logger.info(f"File already exists: {output_path}")
-            return output_path
+        if not safe_title:
+            safe_title = "Unknown_Title"
 
-        # Get all URLs to try
-        urls_to_try = book.download_urls if book.download_urls else []
-        if not urls_to_try and book.download_url:
-            urls_to_try = [book.download_url]
-
-        if not urls_to_try:
-            logger.error(f"No download URLs available for: {book.title}")
-            return None
-
-        # Try each URL in sequence
-        last_error = None
-        for i, url in enumerate(urls_to_try, 1):
+        # Try each URL
+        for i, url in enumerate(book.download_urls, 1):
             try:
-                logger.info(f"Attempting download {i}/{len(urls_to_try)}: {book.title}")
-                logger.debug(f"URL: {url}")
+                logger.debug(f"Trying URL {i}/{len(book.download_urls)}: {url}")
 
-                response = self.session.get(url, stream=True, timeout=30)
+                response = self.session.get(url, timeout=60, stream=True)
 
-                # Check status code with detailed messages
-                if response.status_code == 401:
-                    logger.warning(
-                        f"URL {i} requires authentication (401), trying next..."
-                    )
-                    continue
-                elif response.status_code == 403:
-                    logger.warning(
-                        f"URL {i} is forbidden/restricted (403), trying next..."
-                    )
-                    continue
-                elif response.status_code == 404:
-                    logger.warning(f"URL {i} not found (404), trying next...")
-                    continue
-                elif response.status_code != 200:
-                    logger.warning(
-                        f"URL {i} failed with status {response.status_code}, trying next..."
-                    )
+                if response.status_code != 200:
+                    logger.debug(f"URL {i} failed with status {response.status_code}")
                     continue
 
-                # Check if we got actual content (not an error page)
-                content_type = response.headers.get("content-type", "").lower()
-                if "text/html" in content_type and "epub" in url:
-                    logger.warning(
-                        f"URL {i} returned HTML instead of book, trying next..."
-                    )
+                # Check if it's actually a book (not an HTML error page)
+                content_type = response.headers.get("content-type", "")
+                if "text/html" in content_type and "epub" not in url.lower():
+                    logger.debug(f"URL {i} returned HTML, not a book file")
                     continue
 
-                # Adjust output path extension based on actual content
-                if "application/pdf" in content_type and output_path.suffix != ".pdf":
-                    output_path = output_path.with_suffix(".pdf")
-                elif (
-                    "application/epub" in content_type and output_path.suffix != ".epub"
-                ):
-                    output_path = output_path.with_suffix(".epub")
+                # Determine file extension from URL or content-type
+                if ".epub" in url:
+                    ext = "epub"
+                elif ".pdf" in url:
+                    ext = "pdf"
+                elif ".mobi" in url:
+                    ext = "mobi"
+                elif "epub" in content_type:
+                    ext = "epub"
+                elif "pdf" in content_type:
+                    ext = "pdf"
+                else:
+                    ext = "epub"  # default
 
-                total_size = int(response.headers.get("content-length", 0))
+                # Create filename
+                filename = f"{safe_author} - {safe_title}.{ext}"
+                filepath = author_dir / filename
 
                 # Download with progress bar
-                with open(output_path, "wb") as f, tqdm(
-                    desc=f"{book.title[:50]}",
-                    total=total_size,
-                    unit="B",
-                    unit_scale=True,
-                    unit_divisor=1024,
-                    disable=total_size == 0,
-                ) as pbar:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                        pbar.update(len(chunk))
+                total_size = int(response.headers.get("content-length", 0))
 
-                # Verify file was downloaded and has content
-                if not output_path.exists() or output_path.stat().st_size < 1000:
-                    logger.warning(
-                        f"Downloaded file too small or missing, trying next URL..."
-                    )
-                    if output_path.exists():
-                        output_path.unlink()
+                with open(filepath, "wb") as f:
+                    if total_size > 0:
+                        with tqdm(
+                            total=total_size,
+                            unit="B",
+                            unit_scale=True,
+                            desc=f"Downloading {book.title[:30]}",
+                        ) as pbar:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                if chunk:
+                                    f.write(chunk)
+                                    pbar.update(len(chunk))
+                    else:
+                        # No content-length header
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+
+                # Verify file size
+                if filepath.stat().st_size < 1000:  # Less than 1KB is suspicious
+                    logger.debug(f"Downloaded file too small, probably an error page")
+                    filepath.unlink()
                     continue
 
-                # Success! Calculate hash and save to database
-                file_hash = self.calculate_hash(output_path)
-
-                if self.db:
-                    book.downloaded = True
-                    self.db.add_book(book, str(output_path), file_hash)
-
-                logger.info(f"✓ Downloaded successfully from URL {i}: {output_path}")
-                return output_path
-
-            except requests.exceptions.Timeout:
-                logger.warning(f"URL {i} timed out, trying next...")
-                last_error = "Timeout"
-                if output_path.exists():
-                    output_path.unlink()
-                continue
-
-            except requests.exceptions.ConnectionError:
-                logger.warning(f"URL {i} connection failed, trying next...")
-                last_error = "Connection error"
-                if output_path.exists():
-                    output_path.unlink()
-                continue
+                logger.info(f"✓ Successfully downloaded: {filename}")
+                return str(filepath)
 
             except Exception as e:
-                logger.warning(f"URL {i} failed with error: {e}, trying next...")
-                last_error = str(e)
-                if output_path.exists():
-                    output_path.unlink()
+                logger.debug(f"URL {i} failed: {e}")
                 continue
 
-        # All URLs failed
-        logger.error(
-            f"✗ Failed to download {book.title} after trying {len(urls_to_try)} URLs. "
-            f"Last error: {last_error}"
-        )
+        logger.warning(f"All URLs failed for book: {book.title}")
         return None
 
-    def download_books(self, books: List[Book], max_workers: int = 3) -> List[Path]:
+    def download_books_parallel(
+        self, books: List[Book], max_workers: int = 5
+    ) -> List[tuple]:
         """Download multiple books in parallel"""
-        downloaded = []
+        results = []
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all download tasks
             future_to_book = {
                 executor.submit(self.download_book, book): book for book in books
             }
 
+            # Process completed downloads
             for future in as_completed(future_to_book):
-                result = future.result()
-                if result:
-                    downloaded.append(result)
+                book = future_to_book[future]
+                try:
+                    filepath = future.result()
+                    results.append((book, filepath))
+                except Exception as e:
+                    logger.error(f"Error downloading {book.title}: {e}")
+                    results.append((book, None))
 
-        return downloaded
+        return results
 
-    def convert_to_kindle(
-        self, input_file: Path, output_format: str = "mobi"
-    ) -> Optional[Path]:
-        """Convert ebook to Kindle format using Calibre"""
-        output_path = input_file.with_suffix(f".{output_format}")
+    def close(self):
+        """Close session"""
+        if self.session:
+            self.session.close()
 
-        if output_path.exists():
-            logger.info(f"Converted file already exists: {output_path}")
-            return output_path
+    def __enter__(self):
+        return self
 
-        # Skip PDF files - they don't convert well
-        if input_file.suffix.lower() == ".pdf":
-            logger.warning(
-                f"Skipping PDF conversion: {input_file.name} (PDFs convert poorly)"
-            )
-            return None
-
-        try:
-            logger.info(f"Converting {input_file.name} to {output_format}")
-            result = subprocess.run(
-                [
-                    "ebook-convert",
-                    str(input_file),
-                    str(output_path),
-                    "--output-profile=kindle",
-                    "--no-inline-toc",
-                    "--max-toc-links=0",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )  # 2 min timeout
-
-            logger.info(f"✓ Converted: {output_path}")
-            return output_path
-
-        except subprocess.TimeoutExpired:
-            logger.error(f"✗ Conversion timed out: {input_file.name}")
-            return None
-        except subprocess.CalledProcessError as e:
-            logger.error(f"✗ Conversion failed: {e.stderr}")
-            return None
-        except FileNotFoundError:
-            logger.error("ebook-convert not found. Install: sudo pacman -S calibre")
-            return None
-
-    def batch_convert(
-        self, files: List[Path], output_format: str = "mobi"
-    ) -> List[Path]:
-        """Convert multiple files"""
-        converted = []
-        for file in tqdm(files, desc="Converting to Kindle format"):
-            result = self.convert_to_kindle(file, output_format)
-            if result:
-                converted.append(result)
-            time.sleep(0.5)
-        return converted
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
 
-class BookScraperCLI:
-    """Main CLI interface for book scraping"""
+class EnhancedBookScraperCLI:
+    """Enhanced CLI with multiple source support"""
 
-    def __init__(self, organize_by_author: bool = True):
+    def __init__(self):
         self.db = BookDatabase()
-        self.downloader = BookDownloader(
-            db=self.db, organize_by_author=organize_by_author
-        )
-        self.gutenberg = GutenbergScraper()
-        self.archive = ArchiveScraper()
+        self.downloader = BookDownloader()
+
+        # Initialize all scrapers
+        self.scrapers = {
+            "gutenberg": GutenbergScraper(),
+            "archive": InternetArchiveScraper(),
+            "openlibrary": OpenLibraryScraper(),
+            "standardebooks": StandardEbooksScraper(),
+            "doab": DOABScraper(),
+        }
 
     def scrape_author(
         self,
         author_name: str,
-        source: str = "gutenberg",
-        limit: Optional[int] = None,
-        convert: bool = True,
-    ) -> None:
-        """Main scraping workflow"""
-        # Normalize author name for consistent searching
-        author_name = normalize_author_name(author_name)
-        logger.info(f"Searching for '{author_name}' on {source}")
+        sources: List[str] = None,
+        limit: int = 50,
+        max_workers: int = 5,
+    ):
+        """Scrape books from multiple sources"""
 
-        # Get books
-        if source == "gutenberg":
-            books = self.gutenberg.get_author_books(author_name)
-        elif source == "archive":
-            books = self.archive.search_author(author_name, limit or 50)
-        else:
-            logger.error(f"Unknown source: {source}")
+        if sources is None:
+            sources = list(self.scrapers.keys())
+
+        # Validate sources
+        invalid_sources = [s for s in sources if s not in self.scrapers]
+        if invalid_sources:
+            logger.error(f"Invalid sources: {invalid_sources}")
+            logger.info(f"Available sources: {list(self.scrapers.keys())}")
             return
 
-        if not books:
-            logger.warning("No books found")
+        all_books = []
+
+        # Scrape from each source
+        for source in sources:
+            logger.info(f"\n{'='*70}")
+            logger.info(f"Searching {source.upper()}")
+            logger.info(f"{'='*70}\n")
+
+            try:
+                scraper = self.scrapers[source]
+
+                # Different scrapers have different method names
+                if source == "gutenberg":
+                    books = scraper.get_author_books(author_name)
+                else:
+                    books = scraper.search_author(author_name, limit=limit)
+
+                # Filter out already downloaded books
+                new_books = [book for book in books if not self.db.book_exists(book.id)]
+
+                logger.info(f"Found {len(books)} books ({len(new_books)} new)")
+                all_books.extend(new_books[:limit])
+
+            except Exception as e:
+                logger.error(f"Error scraping {source}: {e}")
+                continue
+
+        if not all_books:
+            logger.warning("No new books found across all sources")
             return
 
-        logger.info(f"Found {len(books)} books")
+        # Download books
+        logger.info(f"\n{'='*70}")
+        logger.info(f"Downloading {len(all_books)} books")
+        logger.info(f"{'='*70}\n")
 
-        if limit:
-            books = books[:limit]
+        results = self.downloader.download_books_parallel(all_books, max_workers)
 
-        # Download
-        logger.info(f"Downloading {len(books)} books...")
-        downloaded = self.downloader.download_books(books)
+        # Update database
+        successful = 0
+        for book, filepath in results:
+            if filepath:
+                self.db.add_book(book, filepath)
+                successful += 1
 
-        logger.info(f"Successfully downloaded {len(downloaded)} books")
+                # Track if borrowable
+                if hasattr(book, "is_borrowable") and book.is_borrowable:
+                    due_date = datetime.now() + timedelta(days=14)
+                    self.db.add_borrow(book.id, due_date)
+            else:
+                # Add to database without file path (failed download)
+                self.db.add_book(book, None)
 
-        # Convert to Kindle format
-        if convert and downloaded:
-            logger.info("Converting to Kindle format...")
-            converted = self.downloader.batch_convert(downloaded)
-            logger.info(f"Converted {len(converted)} books to Kindle format")
+        # Print summary
+        logger.info(f"\n{'='*70}")
+        logger.info(f"DOWNLOAD SUMMARY")
+        logger.info(f"{'='*70}")
+        logger.info(f"Total found: {len(all_books)}")
+        logger.info(f"Successfully downloaded: {successful}")
+        logger.info(f"Failed: {len(all_books) - successful}")
 
-    def show_stats(self) -> None:
-        """Show download statistics"""
-        books = self.db.get_all_books()
+        # Show stats
+        self.show_stats()
 
-        if not books:
-            print("No books in database")
+    def show_stats(self):
+        """Display database statistics"""
+        stats = self.db.get_stats()
+
+        print(f"\n{'='*70}")
+        print("LIBRARY STATISTICS")
+        print(f"{'='*70}")
+        print(f"Total downloaded: {stats['total_downloaded']} books")
+        print(f"Total size: {stats['total_size_mb']:.2f} MB")
+        print(f"\nBy source:")
+        for source, count in stats["by_source"].items():
+            print(f"  {source:15} {count:5} books")
+
+    def list_borrows(self):
+        """List all active borrowed books"""
+        borrows = self.db.get_active_borrows()
+
+        if not borrows:
+            print("No active borrows")
             return
 
-        print(f"\n{'='*60}")
-        print(f"Total books: {len(books)}")
-        print(f"Downloaded: {sum(1 for b in books if b['downloaded'])}")
-        print(f"{'='*60}\n")
+        print(f"\n{'='*70}")
+        print("ACTIVE BORROWS")
+        print(f"{'='*70}\n")
 
-        # Group by author
-        by_author: Dict[str, List[Dict]] = {}
-        for book in books:
-            author = book["author"]
-            by_author.setdefault(author, []).append(book)
+        for borrow in borrows:
+            due_date = datetime.fromisoformat(borrow["due_date"])
+            days_left = (due_date - datetime.now()).days
 
-        print("Books by author:")
-        for author, author_books in sorted(
-            by_author.items(), key=lambda x: len(x[1]), reverse=True
-        ):
-            print(f"  {author}: {len(author_books)} books")
+            print(f"Title: {borrow['title']}")
+            print(f"Author: {borrow['author']}")
+            print(f"Source: {borrow['source']}")
+            print(f"Due: {due_date.strftime('%Y-%m-%d')} ({days_left} days left)")
+            print()
 
-    def close(self) -> None:
-        """Close database connection"""
-        self.db.close()
+    def close(self):
+        """Close all resources"""
+        if hasattr(self, "db"):
+            self.db.close()
+        if hasattr(self, "downloader"):
+            self.downloader.close()
+        for scraper in self.scrapers.values():
+            if hasattr(scraper, "close"):
+                scraper.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
 
-def main() -> None:
-    """Main entry point"""
-    import argparse
-
+def main():
     parser = argparse.ArgumentParser(
-        description="Multi-source book scraper with automatic URL fallback"
+        description="Enhanced Book Scraper - Download free books from multiple sources",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Search all sources
+  %(prog)s "Neil Gaiman"
+  
+  # Search specific sources
+  %(prog)s "Brandon Sanderson" --sources openlibrary archive
+  
+  # Limit results
+  %(prog)s "Mark Twain" --limit 10
+  
+  # Show statistics
+  %(prog)s --stats
+  
+  # List borrowed books
+  %(prog)s --borrows
+  
+Available sources:
+  - gutenberg     : Project Gutenberg (classic public domain)
+  - archive       : Internet Archive (wide variety)
+  - openlibrary   : Open Library (modern books, borrowing)
+  - standardebooks: Standard Ebooks (high-quality public domain)
+  - doab          : Directory of Open Access Books (academic)
+        """,
     )
-    parser.add_argument("author", help="Author name to search for")
+
+    parser.add_argument("author", nargs="?", help="Author name to search for")
     parser.add_argument(
+        "--sources",
         "-s",
-        "--source",
-        choices=["gutenberg", "archive"],
-        default="gutenberg",
-        help="Source to scrape from (default: gutenberg)",
+        nargs="+",
+        choices=[
+            "gutenberg",
+            "archive",
+            "openlibrary",
+            "standardebooks",
+            "doab",
+            "all",
+        ],
+        default=["all"],
+        help="Sources to search (default: all)",
     )
     parser.add_argument(
-        "-l", "--limit", type=int, help="Limit number of books to download"
+        "--limit", "-l", type=int, default=50, help="Max books per source (default: 50)"
     )
     parser.add_argument(
-        "--no-convert", action="store_true", help="Skip Kindle conversion"
+        "--workers",
+        "-w",
+        type=int,
+        default=5,
+        help="Parallel download workers (default: 5)",
     )
+    parser.add_argument("--stats", action="store_true", help="Show library statistics")
     parser.add_argument(
-        "--no-organize",
-        action="store_true",
-        help="Don't organize books by author (put all in books/ directory)",
+        "--borrows", action="store_true", help="List active borrowed books"
     )
-    parser.add_argument("--stats", action="store_true", help="Show download statistics")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
 
     args = parser.parse_args()
 
-    cli = BookScraperCLI(organize_by_author=not args.no_organize)
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    try:
+    with EnhancedBookScraperCLI() as cli:
+        # Handle different modes
         if args.stats:
             cli.show_stats()
-        else:
+        elif args.borrows:
+            cli.list_borrows()
+        elif args.author:
+            # Determine sources
+            sources = None if "all" in args.sources else args.sources
+
+            # Scrape and download
             cli.scrape_author(
                 args.author,
-                source=args.source,
+                sources=sources,
                 limit=args.limit,
-                convert=not args.no_convert,
+                max_workers=args.workers,
             )
-    finally:
-        cli.close()
+        else:
+            parser.print_help()
 
 
 if __name__ == "__main__":
