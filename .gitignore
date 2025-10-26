@@ -1,0 +1,43 @@
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Project specific
+books/
+*.db
+email_config.json
+
+# Keep template
+!email_config.json.template
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+*.bak
+
+# Logs
+*.log
+
+# Test outputs
+test_downloads/
