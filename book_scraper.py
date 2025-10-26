@@ -15,6 +15,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock
 from typing import Dict, List, Optional
 
 import requests
@@ -60,7 +61,8 @@ class BookDatabase:
 
     def __init__(self, db_path: str = "books.db"):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.lock = Lock()  # Thread-safe operations
         self.create_tables()
 
     def create_tables(self) -> None:
@@ -94,45 +96,48 @@ class BookDatabase:
         file_hash: Optional[str] = None,
     ) -> None:
         """Add or update a book in the database"""
-        cursor = self.conn.cursor()
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO books 
-            (id, title, author, source, year, language, subjects, download_url, 
-             cover_url, downloaded, file_path, file_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-            (
-                book.id,
-                book.title,
-                book.author,
-                book.source,
-                book.year,
-                book.language,
-                json.dumps(book.subjects),
-                book.download_url,
-                book.cover_url,
-                book.downloaded,
-                file_path,
-                file_hash,
-            ),
-        )
-        self.conn.commit()
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO books 
+                (id, title, author, source, year, language, subjects, download_url, 
+                 cover_url, downloaded, file_path, file_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+                (
+                    book.id,
+                    book.title,
+                    book.author,
+                    book.source,
+                    book.year,
+                    book.language,
+                    json.dumps(book.subjects),
+                    book.download_url,
+                    book.cover_url,
+                    book.downloaded,
+                    file_path,
+                    file_hash,
+                ),
+            )
+            self.conn.commit()
 
     def is_downloaded(self, book_id: str) -> bool:
         """Check if a book has been downloaded"""
-        cursor = self.conn.cursor()
-        result = cursor.execute(
-            "SELECT downloaded FROM books WHERE id = ?", (book_id,)
-        ).fetchone()
-        return bool(result[0]) if result else False
+        with self.lock:
+            cursor = self.conn.cursor()
+            result = cursor.execute(
+                "SELECT downloaded FROM books WHERE id = ?", (book_id,)
+            ).fetchone()
+            return bool(result[0]) if result else False
 
     def get_all_books(self) -> List[Dict]:
         """Get all books from database as dictionaries"""
-        cursor = self.conn.cursor()
-        results = cursor.execute("SELECT * FROM books").fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        return [dict(zip(columns, row)) for row in results]
+        with self.lock:
+            cursor = self.conn.cursor()
+            results = cursor.execute("SELECT * FROM books").fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            return [dict(zip(columns, row)) for row in results]
 
     def close(self) -> None:
         """Close database connection"""
