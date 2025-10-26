@@ -2,8 +2,68 @@
 
 Scrape free, public domain books from multiple sources and automatically convert them for Kindle.
 
+## ⚠️ PUBLIC DOMAIN ONLY
+
+**This scraper only works for PUBLIC DOMAIN books (published before 1929).**
+
+Modern authors like Stephen King, J.K. Rowling, or any living author **WILL NOT WORK** - their books are copyrighted and require authentication/purchasing.
+
+### ✅ Works Great For (Classic Authors)
+
+**American Classics:**
+
+- Mark Twain - Tom Sawyer, Huckleberry Finn
+- Edgar Allan Poe - The Raven, Tales of Mystery
+- Nathaniel Hawthorne - The Scarlet Letter
+- Herman Melville - Moby Dick
+- Jack London - Call of the Wild, White Fang
+- O. Henry - Short Stories
+- F. Scott Fitzgerald - The Great Gatsby (1925)
+
+**British Classics:**
+
+- Charles Dickens - Oliver Twist, A Tale of Two Cities
+- Jane Austen - Pride and Prejudice, Emma
+- Arthur Conan Doyle - Sherlock Holmes
+- Oscar Wilde - The Picture of Dorian Gray
+- Bram Stoker - Dracula
+- Robert Louis Stevenson - Treasure Island
+- Lewis Carroll - Alice in Wonderland
+
+**Science Fiction & Horror:**
+
+- H.G. Wells - The Time Machine, War of the Worlds
+- Jules Verne - 20,000 Leagues Under the Sea
+- Mary Shelley - Frankenstein
+- H.P. Lovecraft - The Call of Cthulhu
+
+**Russian Literature:**
+
+- Leo Tolstoy - War and Peace, Anna Karenina
+- Fyodor Dostoevsky - Crime and Punishment
+- Anton Chekhov - Short Stories
+
+**Philosophy & Non-Fiction:**
+
+- Plato, Aristotle, Marcus Aurelius
+- Nietzsche, Kant, Descartes
+- Darwin, Tesla, Einstein (early works)
+
+### ❌ Won't Work (Copyrighted Authors)
+
+- Stephen King (b. 1947)
+- J.K. Rowling (b. 1965)
+- George R.R. Martin (b. 1948)
+- Neil Gaiman (b. 1960)
+- Brandon Sanderson (b. 1975)
+- Any author born after 1930
+- Any books published after 1928
+
+**For modern books:** Use your library (Libby app), purchase, or subscription services.
+
 ## ✨ Key Features
 
+- ✅ **Public Domain Books** - 70,000+ classic books (pre-1929) from Gutenberg + millions from Archive.org
 - ✅ **Multi-URL Fallback** - Tries 5+ URLs per book for 92% success rate (up from 65%)
 - ✅ **Smart Author Names** - Handles any format: "MARK TWAIN", "mark twain", " Mark Twain " all work
 - ✅ **Auto Organization** - Books organized by author into subdirectories
@@ -12,6 +72,7 @@ Scrape free, public domain books from multiple sources and automatically convert
 - ✅ **Kindle Conversion** - Automatic EPUB → MOBI conversion
 - ✅ **Email to Kindle** - Send books directly to your Kindle
 - ✅ **Smart Tracking** - SQLite database prevents duplicate downloads
+- ✅ **Copyright Detection** - Automatically skips copyrighted/restricted books
 - ✅ **Type Safe** - Production-ready code with full type hints
 - ✅ **Fast Setup** - UV package manager for 10-100x faster installation
 
@@ -58,30 +119,30 @@ chmod +x *.py
 
 ## 🚀 Quick Start
 
-### 1. Scrape Books (Any Format!)
+### 1. Scrape Books (Public Domain Only!)
 
-All of these work identically:
+All author name formats work:
 
 ```bash
-# Uppercase, lowercase, extra spaces - all work!
+# Classic authors that work great
 ./book_scraper.py "MARK TWAIN" --limit 5
-./book_scraper.py "mark twain" --limit 5
-./book_scraper.py "  Mark   Twain  " --limit 5
+./book_scraper.py "edgar allan poe" --limit 10
+./book_scraper.py "Charles Dickens" --limit 5
 
 # Download from Archive.org
-./book_scraper.py "Edgar Allan Poe" --source archive --limit 10
+./book_scraper.py "H.P. Lovecraft" --source archive --limit 10
 
-# Skip Kindle conversion (EPUB only)
+# Skip Kindle conversion (EPUB only, faster)
 ./book_scraper.py "Jane Austen" --no-convert
 
 # Flat directory (no author folders)
-./book_scraper.py "Charles Dickens" --no-organize
+./book_scraper.py "Arthur Conan Doyle" --no-organize
 
 # Show statistics
 ./book_scraper.py "Mark Twain" --stats
 ```
 
-**New**: Author names are automatically normalized - type them however you want!
+**Note**: Only public domain books (pre-1929) work. Modern authors will fail.
 
 ### 2. File Organization (Default)
 
@@ -672,4 +733,4 @@ MIT License - Do whatever you want with this code.
 
 Happy reading! 📚
 
-**Version**: 2.0.0 (Enhanced)
+**Version**: 3.0.0
