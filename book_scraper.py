@@ -447,7 +447,23 @@ class StandardEbooksScraper:
             opds_url = f"{self.base_url}/opds/all"
 
             logger.info(f"Searching Standard Ebooks for '{author_name}'")
-            response = self.session.get(opds_url, timeout=30)
+
+            # Add headers that might be required
+            headers = {
+                "User-Agent": "BookScraperBot/2.0 (Educational; Linux)",
+                "Accept": "application/atom+xml, application/xml, text/xml, */*",
+            }
+
+            response = self.session.get(opds_url, headers=headers, timeout=30)
+
+            # Handle 401 Unauthorized - API may have changed or require authentication
+            if response.status_code == 401:
+                logger.warning(
+                    f"Standard Ebooks requires authentication or API has changed"
+                )
+                logger.info(f"Try: wget {opds_url} to check if accessible")
+                return books
+
             response.raise_for_status()
 
             soup = BeautifulSoup(response.content, "xml")
@@ -733,12 +749,43 @@ class BookDownloader:
             )
             return None
 
-        # Normalize and sanitize author name for consistent folders
-        safe_author = (
-            "".join(c for c in book.author if c.isalnum() or c in (" ", "-", "_"))
-            .strip()
-            .replace(" ", "_")
-        )
+        # Handle author names (especially anthologies with multiple authors)
+        author_name = book.author.strip()
+
+        # Detect anthologies/collections with multiple authors
+        if any(sep in author_name for sep in [",", ";", "/", " and ", " & "]):
+            # Multiple authors - extract first or use "Various Authors"
+            if "," in author_name:
+                first_author = author_name.split(",")[0].strip()
+            elif ";" in author_name:
+                first_author = author_name.split(";")[0].strip()
+            elif " and " in author_name:
+                first_author = author_name.split(" and ")[0].strip()
+            elif " & " in author_name:
+                first_author = author_name.split(" & ")[0].strip()
+            elif "/" in author_name:
+                first_author = author_name.split("/")[0].strip()
+            else:
+                first_author = author_name
+
+            # If still too long or multiple authors, use "Various Authors"
+            if len(first_author) > 50 or not first_author:
+                safe_author = "Various_Authors"
+            else:
+                safe_author = (
+                    "".join(
+                        c for c in first_author if c.isalnum() or c in (" ", "-", "_")
+                    )
+                    .strip()
+                    .replace(" ", "_")[:50]
+                )  # Max 50 chars
+        else:
+            # Single author
+            safe_author = (
+                "".join(c for c in author_name if c.isalnum() or c in (" ", "-", "_"))
+                .strip()
+                .replace(" ", "_")[:50]
+            )  # Max 50 chars
 
         if not safe_author:
             safe_author = "Unknown_Author"
@@ -747,13 +794,15 @@ class BookDownloader:
         author_dir = self.output_dir / safe_author
         author_dir.mkdir(exist_ok=True, parents=True)
 
-        # Sanitize title
+        # Sanitize title with length limit
         safe_title = "".join(
             c for c in book.title if c.isalnum() or c in (" ", "-", "_")
-        ).strip()
+        ).strip()[
+            :100
+        ]  # Max 100 chars
 
         if not safe_title:
-            safe_title = "Unknown_Title"
+            safe_title = f"Book_{book.id}"[:100]
 
         # Try each URL
         for i, url in enumerate(book.download_urls, 1):
@@ -762,14 +811,31 @@ class BookDownloader:
 
                 response = self.session.get(url, timeout=60, stream=True)
 
-                if response.status_code != 200:
+                if response.status_code == 403:
+                    logger.debug(
+                        f"URL {i} forbidden (403) - may require authentication or borrowing"
+                    )
+                    continue
+                elif response.status_code == 404:
+                    logger.debug(f"URL {i} not found (404)")
+                    continue
+                elif response.status_code == 401:
+                    logger.debug(
+                        f"URL {i} unauthorized (401) - may require account or borrowing"
+                    )
+                    continue
+                elif response.status_code != 200:
                     logger.debug(f"URL {i} failed with status {response.status_code}")
                     continue
 
-                # Check if it's actually a book (not an HTML error page)
+                # Check if it's actually a book (not an HTML error page or login page)
                 content_type = response.headers.get("content-type", "")
                 if "text/html" in content_type and "epub" not in url.lower():
-                    logger.debug(f"URL {i} returned HTML, not a book file")
+                    # Check if it's a "borrow" page
+                    if "borrow" in url.lower() or "loan" in url.lower():
+                        logger.debug(f"URL {i} is a borrow page, not direct download")
+                    else:
+                        logger.debug(f"URL {i} returned HTML, not a book file")
                     continue
 
                 # Determine file extension from URL or content-type
@@ -786,9 +852,39 @@ class BookDownloader:
                 else:
                     ext = "epub"  # default
 
-                # Create filename
+                # Create filename with length validation
                 filename = f"{safe_author} - {safe_title}.{ext}"
+
+                # Ensure total path length is within limits (255 chars for most filesystems)
+                # Account for author_dir path length
+                max_filename_length = 200  # Conservative limit
+                if len(filename) > max_filename_length:
+                    # Truncate title further if needed
+                    available_for_title = (
+                        max_filename_length - len(safe_author) - len(ext) - 5
+                    )  # " - " + "."
+                    if available_for_title > 20:  # Need reasonable minimum
+                        truncated_title = safe_title[:available_for_title]
+                        filename = f"{safe_author} - {truncated_title}.{ext}"
+                    else:
+                        # Use book ID as fallback for very long author names
+                        filename = f"{safe_author[:50]} - {book.id}.{ext}"
+
                 filepath = author_dir / filename
+
+                # Final safety check - ensure complete path is valid
+                try:
+                    # Test if path is valid by checking length
+                    str(filepath.resolve())
+                    if len(str(filepath)) > 4096:  # Max path length on most systems
+                        raise OSError("Path too long")
+                except OSError:
+                    # Fallback to simple naming
+                    filename = f"{book.id}.{ext}"
+                    filepath = author_dir / filename
+                    logger.warning(
+                        f"Using fallback filename due to path length: {filename}"
+                    )
 
                 # Download with progress bar
                 total_size = int(response.headers.get("content-length", 0))
@@ -825,6 +921,14 @@ class BookDownloader:
                 continue
 
         logger.warning(f"All URLs failed for book: {book.title}")
+
+        # Check if this was a borrowable book that might need special handling
+        if hasattr(book, "is_borrowable") and book.is_borrowable:
+            logger.info(f"Note: '{book.title}' may require borrowing from Open Library")
+            logger.info(
+                f"Visit: {book.borrow_url if hasattr(book, 'borrow_url') and book.borrow_url else 'https://openlibrary.org'}"
+            )
+
         return None
 
     def download_books_parallel(
@@ -959,6 +1063,29 @@ class EnhancedBookScraperCLI:
         logger.info(f"Total found: {len(all_books)}")
         logger.info(f"Successfully downloaded: {successful}")
         logger.info(f"Failed: {len(all_books) - successful}")
+
+        # Check if there were borrowable books that failed
+        failed_borrowable = [
+            book
+            for book, filepath in results
+            if not filepath and hasattr(book, "is_borrowable") and book.is_borrowable
+        ]
+
+        if failed_borrowable:
+            logger.info(f"\n{'='*70}")
+            logger.info(f"BORROWABLE BOOKS (Require Open Library Account)")
+            logger.info(f"{'='*70}")
+            logger.info(f"Found {len(failed_borrowable)} books that require borrowing:")
+            for book in failed_borrowable[:5]:  # Show first 5
+                logger.info(f"  - {book.title} by {book.author}")
+                if hasattr(book, "borrow_url") and book.borrow_url:
+                    logger.info(f"    Borrow at: {book.borrow_url}")
+            if len(failed_borrowable) > 5:
+                logger.info(f"  ... and {len(failed_borrowable) - 5} more")
+            logger.info(f"\nTo borrow these books:")
+            logger.info(f"  1. Create free account at https://openlibrary.org")
+            logger.info(f"  2. Visit book page and click 'Borrow'")
+            logger.info(f"  3. Read online or download for 14 days")
 
         # Show stats
         self.show_stats()
