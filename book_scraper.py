@@ -49,6 +49,8 @@ class Book:
     download_urls: List[str] = field(default_factory=list)
     cover_url: Optional[str] = None
     downloaded: bool = False
+    copyright_status: str = "unknown"
+    lending_required: bool = False
 
     def __post_init__(self):
         """Ensure download_urls is populated from download_url if empty"""
@@ -83,6 +85,8 @@ class BookDatabase:
                 downloaded BOOLEAN,
                 file_path TEXT,
                 file_hash TEXT,
+                copyright_status TEXT,
+                lending_required BOOLEAN,
                 downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """
@@ -102,8 +106,8 @@ class BookDatabase:
                 """
                 INSERT OR REPLACE INTO books 
                 (id, title, author, source, year, language, subjects, download_url, 
-                 cover_url, downloaded, file_path, file_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 cover_url, downloaded, file_path, file_hash, copyright_status, lending_required)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     book.id,
@@ -118,6 +122,8 @@ class BookDatabase:
                     book.downloaded,
                     file_path,
                     file_hash,
+                    book.copyright_status,
+                    book.lending_required,
                 ),
             )
             self.conn.commit()
@@ -217,6 +223,8 @@ class GutenbergScraper:
                 subjects=subjects,
                 download_urls=download_urls,
                 download_url=download_urls[0],
+                copyright_status="public_domain",
+                lending_required=False,
             )
 
         except Exception as e:
@@ -271,7 +279,15 @@ class ArchiveScraper:
         search_url = f"{self.base_url}/advancedsearch.php"
         params = {
             "q": f'creator:"{author_name}" AND mediatype:texts',
-            "fl[]": ["identifier", "title", "creator", "year", "subject"],
+            "fl[]": [
+                "identifier",
+                "title",
+                "creator",
+                "year",
+                "subject",
+                "possible-copyright-status",
+                "lending",
+            ],
             "sort[]": "downloads desc",
             "rows": limit,
             "page": 1,
@@ -283,8 +299,21 @@ class ArchiveScraper:
             data = response.json()
 
             books = []
+            pd_count = 0
+            restricted_count = 0
+
             for doc in data["response"]["docs"]:
                 identifier = doc["identifier"]
+
+                # Check copyright
+                copyright_status = doc.get("possible-copyright-status", "unknown")
+                is_pd = copyright_status == "NOT_IN_COPYRIGHT"
+                needs_lending = doc.get("lending", False)
+
+                if is_pd:
+                    pd_count += 1
+                else:
+                    restricted_count += 1
 
                 # Multiple URL fallbacks for different formats
                 download_urls = [
@@ -313,8 +342,16 @@ class ArchiveScraper:
                     subjects=subjects,
                     download_urls=download_urls,
                     download_url=download_urls[0],
+                    copyright_status="public_domain" if is_pd else "copyrighted",
+                    lending_required=needs_lending,
                 )
                 books.append(book)
+
+            logger.info(f"Found {len(books)} books")
+            if pd_count > 0:
+                logger.info(f"  Public domain: {pd_count}")
+            if restricted_count > 0:
+                logger.warning(f"  Copyrighted/Lending required: {restricted_count}")
 
             return books
 
@@ -359,6 +396,15 @@ class BookDownloader:
             logger.info(f"Already downloaded: {book.title}")
             return None
 
+        # Skip copyrighted books
+        if book.copyright_status == "copyrighted":
+            logger.warning(f"⚠️  Skipping '{book.title}' - Copyrighted")
+            return None
+
+        if book.lending_required:
+            logger.warning(f"⚠️  Skipping '{book.title}' - Requires borrowing/auth")
+            return None
+
         # Create author subdirectory if organizing by author
         if self.organize_by_author:
             author_dir = self.output_dir / self.sanitize_filename(book.author)
@@ -393,8 +439,21 @@ class BookDownloader:
 
                 response = self.session.get(url, stream=True, timeout=30)
 
-                # Check if response is successful
-                if response.status_code != 200:
+                # Check status code with detailed messages
+                if response.status_code == 401:
+                    logger.warning(
+                        f"URL {i} requires authentication (401), trying next..."
+                    )
+                    continue
+                elif response.status_code == 403:
+                    logger.warning(
+                        f"URL {i} is forbidden/restricted (403), trying next..."
+                    )
+                    continue
+                elif response.status_code == 404:
+                    logger.warning(f"URL {i} not found (404), trying next...")
+                    continue
+                elif response.status_code != 200:
                     logger.warning(
                         f"URL {i} failed with status {response.status_code}, trying next..."
                     )
@@ -504,9 +563,16 @@ class BookDownloader:
             logger.info(f"Converted file already exists: {output_path}")
             return output_path
 
+        # Skip PDF files - they don't convert well
+        if input_file.suffix.lower() == ".pdf":
+            logger.warning(
+                f"Skipping PDF conversion: {input_file.name} (PDFs convert poorly)"
+            )
+            return None
+
         try:
             logger.info(f"Converting {input_file.name} to {output_format}")
-            subprocess.run(
+            result = subprocess.run(
                 [
                     "ebook-convert",
                     str(input_file),
@@ -518,18 +584,20 @@ class BookDownloader:
                 check=True,
                 capture_output=True,
                 text=True,
-            )
+                timeout=120,
+            )  # 2 min timeout
 
             logger.info(f"✓ Converted: {output_path}")
             return output_path
 
+        except subprocess.TimeoutExpired:
+            logger.error(f"✗ Conversion timed out: {input_file.name}")
+            return None
         except subprocess.CalledProcessError as e:
             logger.error(f"✗ Conversion failed: {e.stderr}")
             return None
         except FileNotFoundError:
-            logger.error(
-                "ebook-convert not found. Install Calibre: sudo pacman -S calibre"
-            )
+            logger.error("ebook-convert not found. Install: sudo pacman -S calibre")
             return None
 
     def batch_convert(
