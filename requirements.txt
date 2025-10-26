@@ -1,0 +1,11 @@
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+tqdm>=4.66.0
+ebooklib>=0.18
+Pillow>=10.0.0
+
+# Optional: Web UI
+flask>=3.0.0
+
+# Optional but recommended
+# calibre (install via pacman: sudo pacman -S calibre)
