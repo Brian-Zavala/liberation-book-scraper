@@ -6,6 +6,7 @@ Supports: Gutenberg, Internet Archive, Open Library, DOAB, Standard Ebooks
 import argparse
 import json
 import logging
+import re
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -36,14 +37,13 @@ class Book:
     format: str = "epub"
     year: Optional[int] = None
     description: Optional[str] = None
-    cover_url: Optional[str] = None
+    cover_url: Optional[str] = None  # For future UI/display purposes
     isbn: Optional[str] = None
     language: str = "en"
     subjects: List[str] = field(default_factory=list)
 
     # Open Library specific
     is_borrowable: bool = False
-    availability: Optional[Dict] = None
     borrow_url: Optional[str] = None
 
 
@@ -217,7 +217,7 @@ class BookDatabase:
         """Context manager entry"""
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
         """Context manager exit"""
         self.close()
         return False
@@ -241,6 +241,7 @@ class OpenLibraryScraper:
             return []
 
         books = []
+        searched_author = author_name.strip().lower()
 
         try:
             # Search API
@@ -268,6 +269,35 @@ class OpenLibraryScraper:
                     if not book_key:
                         continue
 
+                    # CRITICAL: Validate author matches
+                    doc_authors = doc.get("author_name", [])
+                    if not doc_authors:
+                        logger.debug(
+                            f"Skipping book with no author: {doc.get('title')}"
+                        )
+                        continue
+
+                    # Check if searched author is in the book's author list
+                    author_match = False
+                    for doc_author in doc_authors:
+                        doc_author_lower = doc_author.lower()
+                        # Check for exact match or if one contains the other
+                        if (
+                            searched_author in doc_author_lower
+                            or doc_author_lower in searched_author
+                            or self._fuzzy_author_match(
+                                searched_author, doc_author_lower
+                            )
+                        ):
+                            author_match = True
+                            break
+
+                    if not author_match:
+                        logger.debug(
+                            f"Skipping book by different author: {doc.get('title')} by {doc_authors[0]}"
+                        )
+                        continue
+
                     # Get detailed info
                     book = self._get_book_details(book_key, doc)
                     if book:
@@ -277,12 +307,108 @@ class OpenLibraryScraper:
                     logger.debug(f"Error processing book: {e}")
                     continue
 
-            logger.info(f"Successfully processed {len(books)} books from Open Library")
+            logger.info(
+                f"Successfully processed {len(books)} books from Open Library (after author filtering)"
+            )
 
         except Exception as e:
             logger.error(f"Error searching Open Library: {e}")
 
         return books
+
+    def _fuzzy_author_match(self, searched: str, found: str) -> bool:
+        """Check if author names match allowing for variations"""
+
+        prefixes = [
+            "dr ",
+            "dr. ",
+            "mr ",
+            "mr. ",
+            "mrs ",
+            "mrs. ",
+            "ms ",
+            "ms. ",
+            "prof ",
+            "prof. ",
+        ]
+        suffixes = [" jr", " jr.", " sr", " sr.", " ii", " iii", " iv"]
+
+        def normalize(name):
+            name = name.lower().strip()
+            # Remove punctuation except spaces
+            name = re.sub(r"[^\w\s]", " ", name)
+            # Remove extra spaces
+            name = " ".join(name.split())
+
+            for prefix in prefixes:
+                prefix_clean = prefix.strip().replace(".", "")
+                if name.startswith(prefix_clean + " "):
+                    name = name[len(prefix_clean) :].strip()
+            for suffix in suffixes:
+                suffix_clean = suffix.strip().replace(".", "")
+                if name.endswith(" " + suffix_clean):
+                    name = name[: -len(suffix_clean)].strip()
+            return name.strip()
+
+        searched_norm = normalize(searched)
+        found_norm = normalize(found)
+
+        # Exact match after normalization
+        if searched_norm == found_norm:
+            return True
+
+        # Split into words for flexible matching
+        searched_words = set(searched_norm.split())
+        found_words = set(found_norm.split())
+
+        # Remove single letters and very common words
+        common_fillers = {
+            "a",
+            "b",
+            "c",
+            "d",
+            "e",
+            "f",
+            "g",
+            "h",
+            "i",
+            "j",
+            "k",
+            "l",
+            "m",
+            "n",
+            "o",
+            "p",
+            "q",
+            "r",
+            "s",
+            "t",
+            "u",
+            "v",
+            "w",
+            "x",
+            "y",
+            "z",
+            "de",
+            "van",
+            "von",
+            "del",
+            "la",
+            "le",
+        }
+        searched_words = {
+            w for w in searched_words if len(w) > 1 and w not in common_fillers
+        }
+        found_words = {w for w in found_words if len(w) > 1 and w not in common_fillers}
+
+        if not searched_words or not found_words:
+            return False
+
+        # Match if at least 2 significant words match (or all words if less than 2)
+        common_words = searched_words & found_words
+        min_matches = min(2, len(searched_words))
+
+        return len(common_words) >= min_matches
 
     def _get_book_details(self, book_key: str, search_doc: Dict) -> Optional[Book]:
         """Get detailed book information"""
@@ -297,7 +423,6 @@ class OpenLibraryScraper:
             # Check if borrowable
             ia_id = search_doc.get("ia", [])
             lending_edition = search_doc.get("lending_edition_s")
-            has_fulltext = search_doc.get("has_fulltext", False)
 
             # Build download URLs
             download_urls = []
@@ -367,7 +492,7 @@ class OpenLibraryScraper:
         """Context manager entry"""
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
         """Context manager exit"""
         self.close()
         return False
@@ -410,8 +535,8 @@ class DOABScraper:
             )
 
             # Process results (structure depends on DOAB API version)
-            # Placeholder for actual implementation
-            logger.info(f"DOAB search complete (implementation may need API key)")
+            # Note: DOAB API implementation is placeholder
+            # Full implementation would parse results here
 
         except Exception as e:
             logger.error(f"Error searching DOAB: {e}")
@@ -426,7 +551,7 @@ class DOABScraper:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.close()
         return False
 
@@ -551,7 +676,7 @@ class StandardEbooksScraper:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.close()
         return False
 
@@ -636,7 +761,7 @@ class GutenbergScraper:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.close()
         return False
 
@@ -651,6 +776,7 @@ class InternetArchiveScraper:
     def search_author(self, author_name: str, limit: int = 50) -> List[Book]:
         """Search Internet Archive for books"""
         books = []
+        searched_author = author_name.strip().lower()
 
         try:
             search_url = f"{self.base_url}/advancedsearch.php"
@@ -679,11 +805,39 @@ class InternetArchiveScraper:
                         continue
 
                     title = doc.get("title", "Unknown")
-                    author = (
-                        doc.get("creator", ["Unknown"])[0]
-                        if isinstance(doc.get("creator"), list)
-                        else doc.get("creator", "Unknown")
-                    )
+
+                    # Get creator(s)
+                    creators = doc.get("creator", [])
+                    if isinstance(creators, str):
+                        creators = [creators]
+                    elif not isinstance(creators, list):
+                        creators = ["Unknown"]
+
+                    if not creators or creators == ["Unknown"]:
+                        logger.debug(f"Skipping book with no creator: {title}")
+                        continue
+
+                    # Validate at least one creator matches searched author
+                    author_match = False
+                    matched_author = creators[0]  # Default to first
+
+                    for creator in creators:
+                        creator_lower = creator.lower()
+                        if (
+                            searched_author in creator_lower
+                            or creator_lower in searched_author
+                            or self._fuzzy_author_match(searched_author, creator_lower)
+                        ):
+                            author_match = True
+                            matched_author = creator
+                            break
+
+                    if not author_match:
+                        logger.debug(
+                            f"Skipping book by different author: {title} by {creators[0]}"
+                        )
+                        continue
+
                     year = doc.get("year")
                     description = doc.get("description")
 
@@ -697,7 +851,7 @@ class InternetArchiveScraper:
                     book = Book(
                         id=f"archive_{identifier}",
                         title=title,
-                        author=author,
+                        author=matched_author,  # Use the matched author
                         source="archive",
                         download_urls=download_urls,
                         year=int(year) if year else None,
@@ -710,12 +864,107 @@ class InternetArchiveScraper:
                     logger.debug(f"Error processing Archive book: {e}")
                     continue
 
-            logger.info(f"Found {len(books)} books on Internet Archive")
+            logger.info(
+                f"Found {len(books)} books on Internet Archive (after author filtering)"
+            )
 
         except Exception as e:
             logger.error(f"Error searching Internet Archive: {e}")
 
         return books
+
+    def _fuzzy_author_match(self, searched: str, found: str) -> bool:
+
+        prefixes = [
+            "dr ",
+            "dr. ",
+            "mr ",
+            "mr. ",
+            "mrs ",
+            "mrs. ",
+            "ms ",
+            "ms. ",
+            "prof ",
+            "prof. ",
+        ]
+        suffixes = [" jr", " jr.", " sr", " sr.", " ii", " iii", " iv"]
+
+        def normalize(name):
+            name = name.lower().strip()
+            # Remove punctuation except spaces
+            name = re.sub(r"[^\w\s]", " ", name)
+            # Remove extra spaces
+            name = " ".join(name.split())
+
+            for prefix in prefixes:
+                prefix_clean = prefix.strip().replace(".", "")
+                if name.startswith(prefix_clean + " "):
+                    name = name[len(prefix_clean) :].strip()
+            for suffix in suffixes:
+                suffix_clean = suffix.strip().replace(".", "")
+                if name.endswith(" " + suffix_clean):
+                    name = name[: -len(suffix_clean)].strip()
+            return name.strip()
+
+        searched_norm = normalize(searched)
+        found_norm = normalize(found)
+
+        # Exact match after normalization
+        if searched_norm == found_norm:
+            return True
+
+        # Split into words for flexible matching
+        searched_words = set(searched_norm.split())
+        found_words = set(found_norm.split())
+
+        # Remove single letters and very common words
+        common_fillers = {
+            "a",
+            "b",
+            "c",
+            "d",
+            "e",
+            "f",
+            "g",
+            "h",
+            "i",
+            "j",
+            "k",
+            "l",
+            "m",
+            "n",
+            "o",
+            "p",
+            "q",
+            "r",
+            "s",
+            "t",
+            "u",
+            "v",
+            "w",
+            "x",
+            "y",
+            "z",
+            "de",
+            "van",
+            "von",
+            "del",
+            "la",
+            "le",
+        }
+        searched_words = {
+            w for w in searched_words if len(w) > 1 and w not in common_fillers
+        }
+        found_words = {w for w in found_words if len(w) > 1 and w not in common_fillers}
+
+        if not searched_words or not found_words:
+            return False
+
+        # Match if at least 2 significant words match (or all words if less than 2)
+        common_words = searched_words & found_words
+        min_matches = min(2, len(searched_words))
+
+        return len(common_words) >= min_matches
 
     def close(self):
         """Close session"""
@@ -725,7 +974,7 @@ class InternetArchiveScraper:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.close()
         return False
 
@@ -963,7 +1212,7 @@ class BookDownloader:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.close()
         return False
 
@@ -1138,7 +1387,7 @@ class EnhancedBookScraperCLI:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.close()
         return False
 
