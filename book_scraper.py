@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Book:
-    """Enhanced book metadata with modern features"""
+    """Book metadata"""
 
     id: str
     title: str
@@ -48,7 +48,7 @@ class Book:
 
 
 class BookDatabase:
-    """Enhanced database with borrowing tracking"""
+    """Database with borrowing tracking"""
 
     def __init__(self, db_path: str = "books_enhanced.db"):
         self.db_path = db_path
@@ -1158,7 +1158,17 @@ class BookDownloader:
 
                 # Verify file size
                 if filepath.stat().st_size < 1000:  # Less than 1KB is suspicious
-                    logger.debug(f"Downloaded file too small, probably an error page")
+                    logger.debug(
+                        f"Downloaded file too small ({filepath.stat().st_size} bytes), probably an error page"
+                    )
+                    filepath.unlink()
+                    continue
+
+                # Validate file format by checking magic bytes
+                if not self._validate_file_format(filepath, ext):
+                    logger.debug(
+                        f"File validation failed - not a valid {ext.upper()} file"
+                    )
                     filepath.unlink()
                     continue
 
@@ -1179,6 +1189,71 @@ class BookDownloader:
             )
 
         return None
+
+    def _validate_file_format(self, filepath: Path, expected_ext: str) -> bool:
+        """Validate file is actually the expected format by checking magic bytes"""
+        try:
+            with open(filepath, "rb") as f:
+                header = f.read(1024)  # Read first 1KB
+
+            # Check for HTML (error pages disguised as books)
+            if (
+                header.startswith(b"<!DOCTYPE")
+                or header.startswith(b"<html")
+                or b"<HTML" in header[:100]
+            ):
+                logger.warning(
+                    f"Downloaded file is HTML error page, not a {expected_ext.upper()}"
+                )
+                # Try to extract error message
+                header_str = header.decode("utf-8", errors="ignore")
+                if "borrow" in header_str.lower():
+                    logger.info("This book may require borrowing from Open Library")
+                elif "login" in header_str.lower() or "sign in" in header_str.lower():
+                    logger.info("This book may require authentication")
+                return False
+
+            # EPUB is a ZIP file with specific structure
+            if expected_ext == "epub":
+                # EPUB files are ZIP archives starting with PK
+                if not header.startswith(b"PK\x03\x04"):
+                    logger.warning(
+                        f"File claims to be EPUB but doesn't have ZIP magic bytes (got: {header[:4]!r})"
+                    )
+                    return False
+                # Check for mimetype file (required in EPUB)
+                if b"mimetype" not in header and b"application/epub+zip" not in header:
+                    logger.warning(
+                        "File is ZIP but missing EPUB mimetype - may be corrupted"
+                    )
+                    # Still might be valid, don't fail
+                return True
+
+            # PDF files
+            elif expected_ext == "pdf":
+                if not header.startswith(b"%PDF-"):
+                    logger.warning(
+                        f"File claims to be PDF but doesn't have PDF magic bytes (got: {header[:5]!r})"
+                    )
+                    return False
+                return True
+
+            # MOBI files
+            elif expected_ext == "mobi":
+                # MOBI files can have various headers
+                if header[60:68] == b"BOOKMOBI" or header[60:68] == b"TEXtREAd":
+                    return True
+                logger.warning(
+                    f"File claims to be MOBI but doesn't have MOBI magic bytes"
+                )
+                return False
+
+            # Unknown format - allow it
+            return True
+
+        except Exception as e:
+            logger.debug(f"Error validating file format: {e}")
+            return False
 
     def download_books_parallel(
         self, books: List[Book], max_workers: int = 5
