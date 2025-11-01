@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Supports: Gutenberg, Internet Archive, Open Library, DOAB, Standard Ebooks
+Multi-Source Book Scraper - FIXED VERSION
+
+Supports: Gutenberg, Internet Archive, Open Library, DOAB, Standard Ebooks,
+          LibGen, Z-Library, Hoopla
 """
 
 import argparse
@@ -13,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
-
+from urllib.parse import quote, urljoin
 import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
@@ -1039,9 +1042,9 @@ class BookDownloader:
         if not safe_author:
             safe_author = "Unknown_Author"
 
-        # Create author directory (all sources/formats go here)
+        # ✅ FIX: Prepare directory path but DON'T create it yet
+        # Only create after we have a successful download
         author_dir = self.output_dir / safe_author
-        author_dir.mkdir(exist_ok=True, parents=True)
 
         # Sanitize title with length limit
         safe_title = "".join(
@@ -1076,6 +1079,9 @@ class BookDownloader:
                 elif response.status_code != 200:
                     logger.debug(f"URL {i} failed with status {response.status_code}")
                     continue
+
+                # ✅ FIX: NOW create directory since we have successful HTTP response
+                author_dir.mkdir(exist_ok=True, parents=True)
 
                 # Check if it's actually a book (not an HTML error page or login page)
                 content_type = response.headers.get("content-type", "")
@@ -1162,6 +1168,9 @@ class BookDownloader:
                         f"Downloaded file too small ({filepath.stat().st_size} bytes), probably an error page"
                     )
                     filepath.unlink()
+                    # ✅ FIX: Clean up empty directory
+                    if author_dir.exists() and not any(author_dir.iterdir()):
+                        author_dir.rmdir()
                     continue
 
                 # Validate file format by checking magic bytes
@@ -1170,6 +1179,9 @@ class BookDownloader:
                         f"File validation failed - not a valid {ext.upper()} file"
                     )
                     filepath.unlink()
+                    # ✅ FIX: Clean up empty directory
+                    if author_dir.exists() and not any(author_dir.iterdir()):
+                        author_dir.rmdir()
                     continue
 
                 logger.info(f"✓ Successfully downloaded: {filename}")
@@ -1180,6 +1192,11 @@ class BookDownloader:
                 continue
 
         logger.warning(f"All URLs failed for book: {book.title}")
+
+        # ✅ FIX: Final cleanup - remove empty directory if it was created
+        if author_dir.exists() and not any(author_dir.iterdir()):
+            logger.debug(f"Removing empty directory: {author_dir}")
+            author_dir.rmdir()
 
         # Check if this was a borrowable book that might need special handling
         if hasattr(book, "is_borrowable") and book.is_borrowable:
@@ -1292,6 +1309,401 @@ class BookDownloader:
         return False
 
 
+class LibGenScraper:
+    """
+    Library Genesis Scraper
+
+    LEGAL NOTE: LibGen hosts copyrighted material. This is for educational purposes.
+    Use responsibly and consider purchasing books you enjoy to support authors.
+    """
+
+    def __init__(self):
+        self.mirrors = ["http://libgen.rs", "http://libgen.is", "http://libgen.st"]
+        self.base_url = self.mirrors[0]  # Try first mirror
+        self.session = requests.Session()
+        self.session.headers.update(
+            {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+        )
+
+    def search_author(self, author_name: str, limit: int = 50) -> List[dict]:
+        """Search LibGen by author name"""
+        books = []
+
+        try:
+            # LibGen search URL
+            search_url = f"{self.base_url}/search.php"
+            params = {
+                "req": author_name,
+                "lg_topic": "libgen",
+                "open": 0,
+                "view": "simple",
+                "res": min(limit, 100),  # Max 100 per page
+                "phrase": 1,  # Exact phrase
+                "column": "author",
+            }
+
+            response = self.session.get(search_url, params=params, timeout=15)
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.content, "html.parser")
+
+            # Find all book rows in results table
+            rows = soup.select("table.c tr")[1:]  # Skip header row
+
+            for row in rows[:limit]:
+                try:
+                    cols = row.find_all("td")
+                    if len(cols) < 10:
+                        continue
+
+                    # Extract book info
+                    title_col = cols[2]
+                    title_link = title_col.find("a")
+                    title = (
+                        title_link.text.strip()
+                        if title_link
+                        else title_col.text.strip()
+                    )
+
+                    author = cols[1].text.strip()
+                    year = cols[4].text.strip()
+                    pages = cols[5].text.strip()
+                    language = cols[6].text.strip()
+                    size = cols[7].text.strip()
+                    extension = cols[8].text.strip().lower()
+
+                    # Get download links
+                    mirrors_col = cols[9]
+                    mirror_links = mirrors_col.find_all("a")
+
+                    download_urls = []
+                    for link in mirror_links:
+                        href = link.get("href", "")
+                        if href:
+                            download_urls.append(urljoin(self.base_url, href))
+
+                    if not download_urls:
+                        continue
+
+                    # Create book object
+                    book = {
+                        "id": f"libgen_{hash(title + author)}",
+                        "title": title,
+                        "author": author,
+                        "source": "libgen",
+                        "download_urls": download_urls,
+                        "format": extension,
+                        "year": int(year) if year.isdigit() else None,
+                        "language": language,
+                        "pages": pages,
+                        "size": size,
+                    }
+
+                    books.append(book)
+
+                except Exception as e:
+                    print(f"Error parsing LibGen row: {e}")
+                    continue
+
+            print(f"Found {len(books)} books on LibGen")
+            return books
+
+        except Exception as e:
+            print(f"LibGen search error: {e}")
+            # Try next mirror
+            if len(self.mirrors) > 1:
+                self.base_url = self.mirrors[1]
+                print(f"Trying mirror: {self.base_url}")
+                return self.search_author(author_name, limit)
+            return []
+
+    def get_download_url(self, mirror_url: str) -> Optional[str]:
+        """Extract actual download URL from LibGen mirror page"""
+        try:
+            response = self.session.get(mirror_url, timeout=15)
+            soup = BeautifulSoup(response.content, "html.parser")
+
+            # Look for download link
+            download_link = soup.find("a", string=re.compile(r"GET", re.I))
+            if download_link:
+                return download_link.get("href")
+
+            # Alternative: look for direct link
+            download_link = soup.find(
+                "a", href=re.compile(r"\.(?:pdf|epub|mobi)$", re.I)
+            )
+            if download_link:
+                return download_link.get("href")
+
+            return None
+
+        except Exception as e:
+            print(f"Error getting download URL: {e}")
+            return None
+
+
+class ZLibraryScraper:
+    """
+    Z-Library Scraper
+
+    LEGAL NOTE: Z-Library hosts copyrighted material. This is for educational purposes.
+    Z-Library domains change frequently due to legal pressure.
+    """
+
+    def __init__(self):
+        # Z-Library domains (these change frequently)
+        self.domains = [
+            "https://z-lib.gs",  # Official as of 2024
+            "https://z-lib.io",
+            "https://singlelogin.re",
+        ]
+        self.base_url = None
+        self.session = requests.Session()
+        self.session.headers.update(
+            {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+        )
+
+        # Find working domain
+        for domain in self.domains:
+            try:
+                response = self.session.get(domain, timeout=10)
+                if response.status_code == 200:
+                    self.base_url = domain
+                    print(f"Using Z-Library domain: {domain}")
+                    break
+            except:
+                continue
+
+        if not self.base_url:
+            print("Warning: Could not connect to Z-Library. Domain may have changed.")
+
+    def search_author(self, author_name: str, limit: int = 50) -> List[dict]:
+        """Search Z-Library by author"""
+        if not self.base_url:
+            print("Z-Library unavailable. Check for updated domains.")
+            return []
+
+        books = []
+
+        try:
+            # Z-Library search
+            search_url = f"{self.base_url}/s/{quote(author_name)}"
+            params = {"type": "phrase"}
+
+            response = self.session.get(search_url, params=params, timeout=15)
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.content, "html.parser")
+
+            # Find book items (Z-Library structure)
+            book_items = soup.select(".book-item, .bookRow, .resItemBox")
+
+            for item in book_items[:limit]:
+                try:
+                    # Title and link
+                    title_elem = item.select_one("h3 a, .itemCover a, .book-title a")
+                    if not title_elem:
+                        continue
+
+                    title = title_elem.text.strip()
+                    book_url = urljoin(self.base_url, title_elem.get("href", ""))
+
+                    # Author
+                    author_elem = item.select_one(".authors, .author")
+                    author = author_elem.text.strip() if author_elem else author_name
+
+                    # Year and other metadata
+                    year_elem = item.select_one(".property_year, .year")
+                    year = year_elem.text.strip() if year_elem else None
+
+                    # Format
+                    format_elem = item.select_one(".property_extension, .extension")
+                    format_type = (
+                        format_elem.text.strip().lower() if format_elem else "pdf"
+                    )
+
+                    book = {
+                        "id": f"zlib_{hash(title + author)}",
+                        "title": title,
+                        "author": author,
+                        "source": "zlibrary",
+                        "download_urls": [
+                            book_url
+                        ],  # Will need to extract actual download
+                        "format": format_type,
+                        "year": int(year) if year and year.isdigit() else None,
+                    }
+
+                    books.append(book)
+
+                except Exception as e:
+                    print(f"Error parsing Z-Library item: {e}")
+                    continue
+
+            print(f"Found {len(books)} books on Z-Library")
+            return books
+
+        except Exception as e:
+            print(f"Z-Library search error: {e}")
+            return []
+
+    def get_download_url(self, book_url: str) -> Optional[str]:
+        """Get actual download URL from book page"""
+        try:
+            response = self.session.get(book_url, timeout=15)
+            soup = BeautifulSoup(response.content, "html.parser")
+
+            # Look for download button
+            download_btn = soup.select_one(
+                "a.dlButton, .addDownloadedBook, .btn-primary"
+            )
+            if download_btn:
+                return urljoin(self.base_url, download_btn.get("href", ""))
+
+            return None
+
+        except Exception as e:
+            print(f"Error getting Z-Library download URL: {e}")
+            return None
+
+
+class HooplaScraper:
+    """
+    Hoopla Digital Scraper (LEGITIMATE)
+
+    Hoopla is a 100% legal library service with instant borrows.
+    Requires a valid library card from a participating library.
+
+    NOTE: Hoopla requires authentication and uses DRM.
+    This scraper can search for books but actual borrowing requires:
+    1. Valid library card
+    2. Hoopla app or authenticated web session
+    3. Books are DRM-protected (not downloadable as plain files)
+    """
+
+    def __init__(self):
+        self.base_url = "https://www.hoopladigital.com"
+        self.api_url = "https://hoopla-digital.hoopladigital.com/api"
+        self.session = requests.Session()
+        self.session.headers.update(
+            {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+        )
+
+    def search_author(self, author_name: str, limit: int = 50) -> List[dict]:
+        """
+        Search Hoopla for books by author
+
+        Note: This only searches. Actual borrowing requires:
+        - Library card authentication
+        - Hoopla app
+        """
+        books = []
+
+        try:
+            # Hoopla API search
+            search_url = f"{self.api_url}/search"
+            params = {"query": author_name, "kind": "EBOOKS", "limit": min(limit, 100)}
+
+            response = self.session.get(search_url, params=params, timeout=15)
+            response.raise_for_status()
+            data = response.json()
+
+            if "results" not in data:
+                print("No results from Hoopla")
+                return []
+
+            for item in data["results"][:limit]:
+                try:
+                    title = item.get("title", "Unknown")
+                    author = item.get("author", author_name)
+
+                    # Hoopla-specific IDs
+                    hoopla_id = item.get("id")
+                    isbn = item.get("isbn")
+
+                    # Get more details
+                    format_type = "epub"  # Most Hoopla books are EPUB
+
+                    book = {
+                        "id": f"hoopla_{hoopla_id}",
+                        "title": title,
+                        "author": author,
+                        "source": "hoopla",
+                        "download_urls": [],  # Hoopla uses app-based borrowing
+                        "format": format_type,
+                        "isbn": isbn,
+                        "is_borrowable": True,
+                        "borrow_url": f"{self.base_url}/title/{hoopla_id}",
+                        "requires_auth": True,
+                        "note": "Requires Hoopla app and library card",
+                    }
+
+                    books.append(book)
+
+                except Exception as e:
+                    print(f"Error parsing Hoopla item: {e}")
+                    continue
+
+            print(f"Found {len(books)} books on Hoopla")
+            print("Note: Hoopla books require authentication and the Hoopla app")
+            return books
+
+        except Exception as e:
+            print(f"Hoopla search error: {e}")
+            return []
+
+
+# Integration helper functions
+def integrate_scrapers():
+    """
+    Add these scrapers to your EnhancedBookScraperCLI class
+
+    In your book_scraper.py, add to __init__:
+
+    self.scrapers = {
+        'gutenberg': GutenbergScraper(),
+        'archive': InternetArchiveScraper(),
+        'openlibrary': OpenLibraryScraper(),
+        'standardebooks': StandardEbooksScraper(),
+        'doab': DOABScraper(),
+
+        # NEW: Add these
+        'libgen': LibGenScraper(),
+        'zlibrary': ZLibraryScraper(),
+        'hoopla': HooplaScraper(),
+    }
+    """
+    pass
+
+
+if __name__ == "__main__":
+    print("Book Scraper - Additional Sources")
+    print("=" * 60)
+    print()
+    print("LEGAL DISCLAIMER:")
+    print("- LibGen & Z-Library: Gray area sources")
+    print("- Hoopla: 100% legitimate, requires library card")
+    print()
+
+    # Test LibGen
+    print("Testing LibGen...")
+    libgen = LibGenScraper()
+    books = libgen.search_author("Mark Twain", limit=5)
+    print(f"Found {len(books)} books\n")
+
+    # Test Z-Library
+    print("Testing Z-Library...")
+    zlib = ZLibraryScraper()
+    books = zlib.search_author("Mark Twain", limit=5)
+    print(f"Found {len(books)} books\n")
+
+    # Test Hoopla
+    print("Testing Hoopla...")
+    hoopla = HooplaScraper()
+    books = hoopla.search_author("Mark Twain", limit=5)
+    print(f"Found {len(books)} books\n")
+
+
 class EnhancedBookScraperCLI:
     """Enhanced CLI with multiple source support"""
 
@@ -1299,13 +1711,17 @@ class EnhancedBookScraperCLI:
         self.db = BookDatabase()
         self.downloader = BookDownloader()
 
-        # Initialize all scrapers
+        # Initialize all scrapers (including new sources)
         self.scrapers = {
             "gutenberg": GutenbergScraper(),
             "archive": InternetArchiveScraper(),
             "openlibrary": OpenLibraryScraper(),
             "standardebooks": StandardEbooksScraper(),
             "doab": DOABScraper(),
+            # ✅ NEW: Additional sources
+            "libgen": LibGenScraper(),
+            "zlibrary": ZLibraryScraper(),
+            "hoopla": HooplaScraper(),
         }
 
     def scrape_author(
@@ -1489,11 +1905,17 @@ Examples:
   %(prog)s --borrows
   
 Available sources:
+  LEGITIMATE:
   - gutenberg     : Project Gutenberg (classic public domain)
   - archive       : Internet Archive (wide variety)
   - openlibrary   : Open Library (modern books, borrowing)
   - standardebooks: Standard Ebooks (high-quality public domain)
   - doab          : Directory of Open Access Books (academic)
+  - hoopla        : Hoopla Digital (instant borrows, requires library card)
+  
+  ADDITIONAL (use responsibly):
+  - libgen        : Library Genesis (gray area, modern books)
+  - zlibrary      : Z-Library (gray area, large collection)
         """,
     )
 
@@ -1508,6 +1930,10 @@ Available sources:
             "openlibrary",
             "standardebooks",
             "doab",
+            # ✅ NEW: Additional sources
+            "libgen",
+            "zlibrary",
+            "hoopla",
             "all",
         ],
         default=["all"],
